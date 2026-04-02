@@ -155,6 +155,8 @@ protected:
 
   bool reset();
   void halt();
+  double desaturate_wheel_command(
+    Eigen::Vector3d & robot_movement_vector, Eigen::VectorXd & wheel_movement_vector) const;
 };
 }  // namespace omni_wheel_controller
 #endif  // OMNI_WHEEL_CONTROLLER__OMNI_WHEEL_CONTROLLER_HPP_

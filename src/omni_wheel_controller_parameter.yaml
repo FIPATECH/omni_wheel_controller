@@ -69,6 +69,11 @@ omni_wheel_controller:
     default_value: 0.5, # seconds
     description: "Timeout after which input command on ``cmd_vel`` topic is considered staled.",
   }
+  max_wheel_velocity: {
+    type: double,
+    default_value: .NAN,
+    description: "Maximum wheel angular velocity [rad/s] used to isotropically desaturate the commanded wheel vector after body-frame limiting.",
+  }
   publish_limited_velocity: {
     type: bool,
     default_value: false,
@@ -91,6 +96,43 @@ omni_wheel_controller:
   }
   linear:
     x:
+      has_velocity_limits: {
+        type: bool,
+        default_value: false,
+      }
+      has_acceleration_limits: {
+        type: bool,
+        default_value: false,
+      }
+      has_jerk_limits: {
+        type: bool,
+        default_value: false,
+      }
+      max_velocity: {
+        type: double,
+        default_value: .NAN,
+      }
+      min_velocity: {
+        type: double,
+        default_value: .NAN,
+      }
+      max_acceleration: {
+        type: double,
+        default_value: .NAN,
+      }
+      min_acceleration: {
+        type: double,
+        default_value: .NAN,
+      }
+      max_jerk: {
+        type: double,
+        default_value: .NAN,
+      }
+      min_jerk: {
+        type: double,
+        default_value: .NAN,
+      }
+    y:
       has_velocity_limits: {
         type: bool,
         default_value: false,

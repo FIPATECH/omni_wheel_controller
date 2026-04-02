@@ -45,6 +45,7 @@ using controller_interface::InterfaceConfiguration;
 using hardware_interface::HW_IF_POSITION;
 using hardware_interface::HW_IF_VELOCITY;
 using lifecycle_msgs::msg::State;
+using Eigen::Vector3d;
 
 OmniWheelController::OmniWheelController() : controller_interface::ControllerInterface() {}
 
@@ -132,6 +133,28 @@ controller_interface::return_type OmniWheelController::update(
 
   previous_update_timestamp_ = time;
 
+  auto & last_command = previous_commands_.back().twist;
+  auto & second_to_last_command = previous_commands_.front().twist;
+  limiter_linear_x_.limit(
+    linear_x_command, last_command.linear.x, second_to_last_command.linear.x, period.seconds());
+  limiter_linear_y_.limit(
+    linear_y_command, last_command.linear.y, second_to_last_command.linear.y, period.seconds());
+  limiter_angular_.limit(
+    angular_command, last_command.angular.z, second_to_last_command.angular.z, period.seconds());
+
+  Vector3d robot_movement_vector;
+  robot_movement_vector << linear_x_command, linear_y_command, angular_command;
+
+  Eigen::VectorXd wheel_movement_vector = odometry_.getMotionMatrix() * robot_movement_vector;
+  desaturate_wheel_command(robot_movement_vector, wheel_movement_vector);
+
+  linear_x_command = robot_movement_vector.x();
+  linear_y_command = robot_movement_vector.y();
+  angular_command = robot_movement_vector.z();
+
+  previous_commands_.pop();
+  previous_commands_.emplace(command);
+
   if (params_.open_loop)
   {
     odometry_.updateOpenLoop(linear_x_command, linear_y_command, angular_command, time);
@@ -144,9 +167,7 @@ controller_interface::return_type OmniWheelController::update(
       wheel_feedback.push_back(registered_omni_wheel_handles_[index].feedback.get().get_value());
       if (std::isnan(wheel_feedback[index]))
       {
-        RCLCPP_ERROR(
-          logger, "omni wheel %s is invalid for index [%zu]", feedback_type(),
-          index);
+        RCLCPP_ERROR(logger, "omni wheel %s is invalid for index [%zu]", feedback_type(), index);
         return controller_interface::return_type::ERROR;
       }
     }
@@ -205,19 +226,7 @@ controller_interface::return_type OmniWheelController::update(
     }
   }
 
-  auto & last_command = previous_commands_.back().twist;
-  auto & second_to_last_command = previous_commands_.front().twist;
-  limiter_linear_x_.limit(
-    linear_x_command, last_command.linear.x, second_to_last_command.linear.x, period.seconds());
-  limiter_linear_y_.limit(
-    linear_y_command, last_command.linear.y, second_to_last_command.linear.y, period.seconds());
-  limiter_angular_.limit(
-    angular_command, last_command.angular.z, second_to_last_command.angular.z, period.seconds());
-
-  previous_commands_.pop();
-  previous_commands_.emplace(command);
-
-  //    Publish limited velocity
+  // Publish the body-frame command that is actually applied after limiting and wheel desaturation.
   if (publish_limited_velocity_ && realtime_limited_velocity_publisher_->trylock())
   {
     auto & limited_velocity_command = realtime_limited_velocity_publisher_->msg_;
@@ -226,13 +235,6 @@ controller_interface::return_type OmniWheelController::update(
     realtime_limited_velocity_publisher_->unlockAndPublish();
   }
 
-  Eigen::VectorXd robot_movement_vector(3);
-  robot_movement_vector(0) = command.twist.linear.x;
-  robot_movement_vector(1) = command.twist.linear.y;
-  robot_movement_vector(2) = command.twist.angular.z;
-                
-  Eigen::VectorXd wheel_movement_vector = odometry_.getMotionMatrix() * robot_movement_vector;
-  // Compute and set wheels velocities:
   for (size_t index = 0; index < params_.omni_wheel_names.size(); ++index)
   {
     registered_omni_wheel_handles_[index].velocity.get().set_value(wheel_movement_vector(index));
@@ -273,10 +275,10 @@ controller_interface::CallbackReturn OmniWheelController::on_configure(
     params_.linear.x.max_jerk);
 
   limiter_linear_y_ = SpeedLimiter(
-    params_.linear.x.has_velocity_limits, params_.linear.x.has_acceleration_limits,
-    params_.linear.x.has_jerk_limits, params_.linear.x.min_velocity, params_.linear.x.max_velocity,
-    params_.linear.x.min_acceleration, params_.linear.x.max_acceleration, params_.linear.x.min_jerk,
-    params_.linear.x.max_jerk);
+    params_.linear.y.has_velocity_limits, params_.linear.y.has_acceleration_limits,
+    params_.linear.y.has_jerk_limits, params_.linear.y.min_velocity, params_.linear.y.max_velocity,
+    params_.linear.y.min_acceleration, params_.linear.y.max_acceleration, params_.linear.y.min_jerk,
+    params_.linear.y.max_jerk);
 
   limiter_angular_ = SpeedLimiter(
     params_.angular.z.has_velocity_limits, params_.angular.z.has_acceleration_limits,
@@ -514,6 +516,26 @@ void OmniWheelController::halt()
   {
     wheel_handle.velocity.get().set_value(0.0);
   }
+}
+
+double OmniWheelController::desaturate_wheel_command(
+  Vector3d & robot_movement_vector, Eigen::VectorXd & wheel_movement_vector) const
+{
+  if (!std::isfinite(params_.max_wheel_velocity) || params_.max_wheel_velocity <= 0.0)
+  {
+    return 1.0;
+  }
+
+  const double max_requested_wheel_velocity = wheel_movement_vector.cwiseAbs().maxCoeff();
+  if (max_requested_wheel_velocity <= params_.max_wheel_velocity)
+  {
+    return 1.0;
+  }
+
+  const double scale = params_.max_wheel_velocity / max_requested_wheel_velocity;
+  robot_movement_vector *= scale;
+  wheel_movement_vector *= scale;
+  return scale;
 }
 
 controller_interface::CallbackReturn OmniWheelController::configure_handles(

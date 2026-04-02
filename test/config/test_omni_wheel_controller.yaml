@@ -5,6 +5,7 @@ omni_wheel_controller:
 
     omni_wheel_distance : 0.49
     wheel_radius : 0.05
+    max_wheel_velocity: 100.0
 
     odom_frame_id: odom
     base_frame_id: base_link
@@ -28,6 +29,16 @@ omni_wheel_controller:
     linear.x.min_acceleration: -0.4
     linear.x.max_jerk: 0.5
     linear.x.min_jerk: -0.5
+
+    linear.y.has_velocity_limits: true
+    linear.y.has_acceleration_limits: false
+    linear.y.has_jerk_limits: false
+    linear.y.max_velocity: 0.8
+    linear.y.min_velocity: -0.8
+    linear.y.max_acceleration: 0.4
+    linear.y.min_acceleration: -0.4
+    linear.y.max_jerk: 0.5
+    linear.y.min_jerk: -0.5
 
     angular.z.has_velocity_limits: true
     angular.z.has_acceleration_limits: false

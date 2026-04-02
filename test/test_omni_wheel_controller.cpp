@@ -14,6 +14,7 @@
 
 #include <gmock/gmock.h>
 
+#include <cmath>
 #include <array>
 #include <memory>
 #include <string>
@@ -79,6 +80,17 @@ public:
   {
     return realtime_odometry_publisher_;
   }
+
+  std::shared_ptr<realtime_tools::RealtimePublisher<geometry_msgs::msg::TwistStamped>>
+  get_rt_limited_velocity_publisher()
+  {
+    return realtime_limited_velocity_publisher_;
+  }
+
+  const Eigen::MatrixXd & get_motion_matrix() const
+  {
+    return odometry_.getMotionMatrix();
+  }
 };
 
 class TestOmniWheelController : public ::testing::Test
@@ -102,7 +114,7 @@ protected:
    *  linear - magnitude of the linear command in the geometry_msgs::twist message
    *  angular - the magnitude of the angular command in geometry_msgs::twist message
    */
-  void publish(double linear, double angular)
+  void publish(double linear_x, double linear_y, double angular)
   {
     int wait_count = 0;
     auto topic = velocity_publisher->get_topic_name();
@@ -119,7 +131,8 @@ protected:
 
     geometry_msgs::msg::TwistStamped velocity_message;
     velocity_message.header.stamp = pub_node->get_clock()->now();
-    velocity_message.twist.linear.x = linear;
+    velocity_message.twist.linear.x = linear_x;
+    velocity_message.twist.linear.y = linear_y;
     velocity_message.twist.angular.z = angular;
     velocity_publisher->publish(velocity_message);
   }
@@ -185,6 +198,17 @@ protected:
 
   rclcpp::Node::SharedPtr pub_node;
   rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr velocity_publisher;
+
+  void setControllerKinematics(double omni_wheel_distance = 0.4, double wheel_radius = 1.0)
+  {
+    controller_->get_node()->set_parameter(
+      rclcpp::Parameter("omni_wheel_names", rclcpp::ParameterValue(omni_wheel_names)));
+    controller_->get_node()->set_parameter(
+      rclcpp::Parameter("omni_wheel_angle", rclcpp::ParameterValue(omni_wheel_angle)));
+    controller_->get_node()->set_parameter(
+      rclcpp::Parameter("omni_wheel_distance", omni_wheel_distance));
+    controller_->get_node()->set_parameter(rclcpp::Parameter("wheel_radius", wheel_radius));
+  }
 };
 
 TEST_F(TestOmniWheelController, configure_fails_without_parameters)
@@ -446,7 +470,7 @@ TEST_F(TestOmniWheelController, cleanup)
     rclcpp::Parameter("omni_wheel_names", rclcpp::ParameterValue(omni_wheel_names)));
   controller_->get_node()->set_parameter(
     rclcpp::Parameter("omni_wheel_angle", rclcpp::ParameterValue(omni_wheel_angle)));
-  controller_->get_node()->set_parameter(rclcpp::Parameter("wheel_separation", 0.4));
+  controller_->get_node()->set_parameter(rclcpp::Parameter("omni_wheel_distance", 0.4));
   controller_->get_node()->set_parameter(rclcpp::Parameter("wheel_radius", 0.1));
 
   rclcpp::executors::SingleThreadedExecutor executor;
@@ -463,7 +487,7 @@ TEST_F(TestOmniWheelController, cleanup)
   // send msg
   const double linear = 1.0;
   const double angular = 1.0;
-  publish(linear, angular);
+  publish(linear, 0.0, angular);
   controller_->wait_for_twist(executor);
 
   ASSERT_EQ(
@@ -497,7 +521,7 @@ TEST_F(TestOmniWheelController, correct_initialization_using_parameters)
     rclcpp::Parameter("omni_wheel_names", rclcpp::ParameterValue(omni_wheel_names)));
   controller_->get_node()->set_parameter(
     rclcpp::Parameter("omni_wheel_angle", rclcpp::ParameterValue(omni_wheel_angle)));
-  controller_->get_node()->set_parameter(rclcpp::Parameter("wheel_separation", 0.4));
+  controller_->get_node()->set_parameter(rclcpp::Parameter("omni_wheel_distance", 0.4));
   controller_->get_node()->set_parameter(rclcpp::Parameter("wheel_radius", 1.0));
 
   rclcpp::executors::SingleThreadedExecutor executor;
@@ -518,7 +542,7 @@ TEST_F(TestOmniWheelController, correct_initialization_using_parameters)
   // send msg
   const double linear = 1.0;
   const double angular = 0.0;
-  publish(linear, angular);
+  publish(linear, 0.0, angular);
   // wait for msg is be published to the system
   ASSERT_TRUE(controller_->wait_for_twist(executor));
 
@@ -554,5 +578,149 @@ TEST_F(TestOmniWheelController, correct_initialization_using_parameters)
 
   state = controller_->get_node()->configure();
   ASSERT_EQ(State::PRIMARY_STATE_INACTIVE, state.id());
+  executor.cancel();
+}
+
+TEST_F(TestOmniWheelController, update_keeps_unsaturated_command_unchanged)
+{
+  const auto ret = controller_->init(controller_name);
+  ASSERT_EQ(ret, controller_interface::return_type::OK);
+
+  setControllerKinematics();
+  controller_->get_node()->set_parameter(rclcpp::Parameter("publish_limited_velocity", true));
+  controller_->get_node()->set_parameter(rclcpp::Parameter("max_wheel_velocity", 10.0));
+
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(controller_->get_node()->get_node_base_interface());
+
+  auto state = controller_->get_node()->configure();
+  ASSERT_EQ(State::PRIMARY_STATE_INACTIVE, state.id());
+  assignResourcesPosFeedback();
+
+  state = controller_->get_node()->activate();
+  ASSERT_EQ(State::PRIMARY_STATE_ACTIVE, state.id());
+
+  waitForSetup();
+
+  constexpr double linear_x = 0.20;
+  constexpr double linear_y = 0.15;
+  constexpr double angular = 0.10;
+  publish(linear_x, linear_y, angular);
+  ASSERT_TRUE(controller_->wait_for_twist(executor));
+
+  ASSERT_EQ(
+    controller_->update(rclcpp::Time(1, 0, RCL_ROS_TIME), rclcpp::Duration::from_seconds(0.01)),
+    controller_interface::return_type::OK);
+
+  const Eigen::Vector3d command(linear_x, linear_y, angular);
+  const Eigen::VectorXd expected_wheels = controller_->get_motion_matrix() * command;
+  for (size_t index = 0; index < velocity_values_.size(); ++index)
+  {
+    EXPECT_NEAR(expected_wheels(static_cast<Eigen::Index>(index)), velocity_values_[index], 1e-6);
+  }
+
+  const auto limited_velocity_message = controller_->get_rt_limited_velocity_publisher()->msg_;
+  EXPECT_NEAR(linear_x, limited_velocity_message.twist.linear.x, 1e-6);
+  EXPECT_NEAR(linear_y, limited_velocity_message.twist.linear.y, 1e-6);
+  EXPECT_NEAR(angular, limited_velocity_message.twist.angular.z, 1e-6);
+
+  executor.cancel();
+}
+
+TEST_F(TestOmniWheelController, update_uses_linear_y_limiter_configuration)
+{
+  const auto ret = controller_->init(controller_name);
+  ASSERT_EQ(ret, controller_interface::return_type::OK);
+
+  setControllerKinematics();
+  controller_->get_node()->set_parameter(rclcpp::Parameter("publish_limited_velocity", true));
+  controller_->get_node()->set_parameter(rclcpp::Parameter("max_wheel_velocity", 10.0));
+  controller_->get_node()->set_parameter(rclcpp::Parameter("linear.x.has_velocity_limits", true));
+  controller_->get_node()->set_parameter(rclcpp::Parameter("linear.x.max_velocity", 1.0));
+  controller_->get_node()->set_parameter(rclcpp::Parameter("linear.x.min_velocity", -1.0));
+  controller_->get_node()->set_parameter(rclcpp::Parameter("linear.y.has_velocity_limits", true));
+  controller_->get_node()->set_parameter(rclcpp::Parameter("linear.y.max_velocity", 0.2));
+  controller_->get_node()->set_parameter(rclcpp::Parameter("linear.y.min_velocity", -0.2));
+
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(controller_->get_node()->get_node_base_interface());
+
+  auto state = controller_->get_node()->configure();
+  ASSERT_EQ(State::PRIMARY_STATE_INACTIVE, state.id());
+  assignResourcesPosFeedback();
+
+  state = controller_->get_node()->activate();
+  ASSERT_EQ(State::PRIMARY_STATE_ACTIVE, state.id());
+
+  waitForSetup();
+
+  publish(0.0, 0.5, 0.0);
+  ASSERT_TRUE(controller_->wait_for_twist(executor));
+
+  ASSERT_EQ(
+    controller_->update(rclcpp::Time(1, 0, RCL_ROS_TIME), rclcpp::Duration::from_seconds(0.01)),
+    controller_interface::return_type::OK);
+
+  const auto limited_velocity_message = controller_->get_rt_limited_velocity_publisher()->msg_;
+  EXPECT_NEAR(0.0, limited_velocity_message.twist.linear.x, 1e-6);
+  EXPECT_NEAR(0.2, limited_velocity_message.twist.linear.y, 1e-6);
+  EXPECT_NEAR(0.0, limited_velocity_message.twist.angular.z, 1e-6);
+
+  executor.cancel();
+}
+
+TEST_F(TestOmniWheelController, update_desaturates_wheels_isotropically)
+{
+  const auto ret = controller_->init(controller_name);
+  ASSERT_EQ(ret, controller_interface::return_type::OK);
+
+  setControllerKinematics();
+  controller_->get_node()->set_parameter(rclcpp::Parameter("publish_limited_velocity", true));
+  controller_->get_node()->set_parameter(rclcpp::Parameter("max_wheel_velocity", 0.5));
+
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(controller_->get_node()->get_node_base_interface());
+
+  auto state = controller_->get_node()->configure();
+  ASSERT_EQ(State::PRIMARY_STATE_INACTIVE, state.id());
+  assignResourcesPosFeedback();
+
+  state = controller_->get_node()->activate();
+  ASSERT_EQ(State::PRIMARY_STATE_ACTIVE, state.id());
+
+  waitForSetup();
+
+  constexpr double linear_x = 0.90;
+  constexpr double linear_y = 0.45;
+  constexpr double angular = 0.30;
+  publish(linear_x, linear_y, angular);
+  ASSERT_TRUE(controller_->wait_for_twist(executor));
+
+  ASSERT_EQ(
+    controller_->update(rclcpp::Time(1, 0, RCL_ROS_TIME), rclcpp::Duration::from_seconds(0.01)),
+    controller_interface::return_type::OK);
+
+  const Eigen::Vector3d requested_command(linear_x, linear_y, angular);
+  const Eigen::VectorXd requested_wheels = controller_->get_motion_matrix() * requested_command;
+  const double expected_scale = 0.5 / requested_wheels.cwiseAbs().maxCoeff();
+
+  for (size_t index = 0; index < velocity_values_.size(); ++index)
+  {
+    EXPECT_NEAR(
+      requested_wheels(static_cast<Eigen::Index>(index)) * expected_scale, velocity_values_[index],
+      1e-6);
+  }
+
+  const auto limited_velocity_message = controller_->get_rt_limited_velocity_publisher()->msg_;
+  EXPECT_NEAR(linear_x * expected_scale, limited_velocity_message.twist.linear.x, 1e-6);
+  EXPECT_NEAR(linear_y * expected_scale, limited_velocity_message.twist.linear.y, 1e-6);
+  EXPECT_NEAR(angular * expected_scale, limited_velocity_message.twist.angular.z, 1e-6);
+  EXPECT_NEAR(
+    std::fabs(limited_velocity_message.twist.linear.x / linear_x),
+    std::fabs(limited_velocity_message.twist.linear.y / linear_y), 1e-6);
+  EXPECT_NEAR(
+    std::fabs(limited_velocity_message.twist.linear.x / linear_x),
+    std::fabs(limited_velocity_message.twist.angular.z / angular), 1e-6);
+
   executor.cancel();
 }
